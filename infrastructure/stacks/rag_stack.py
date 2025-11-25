@@ -134,13 +134,13 @@ class RagStack(Stack):
     def create_lambda_layers(self):
         """Crea Lambda Layers con dependencias compartidas"""
         
-        # Layer con código compartido (shared/)
+        # Layer con código compartido y dependencias
         self.shared_layer = lambda_.LayerVersion(
             self,
             "SharedCodeLayer",
-            code=lambda_.Code.from_asset("../shared"),
+            code=lambda_.Code.from_asset("../layer_build"),
             compatible_runtimes=[lambda_.Runtime.PYTHON_3_11],
-            description="Código compartido: clientes Bedrock y OpenSearch"
+            description="Código compartido y dependencias: Bedrock, PostgreSQL, PDF processing"
         )
 
     def create_ingestion_lambda(self):
@@ -239,7 +239,7 @@ class RagStack(Stack):
                 "BEDROCK_EMBEDDING_MODEL": "amazon.titan-embed-text-v2:0",
                 "BEDROCK_LLM_MODEL": "anthropic.claude-3-sonnet-20240229-v1:0",
                 "TOP_K": "5",
-                "MIN_SIMILARITY": "0.7",
+                "MIN_SIMILARITY": "0.1",
                 "USE_CACHE": "true"
             }
         )
