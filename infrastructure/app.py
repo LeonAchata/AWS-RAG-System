@@ -3,14 +3,14 @@
 AWS CDK App - Punto de entrada para la infraestructura
 """
 import os
-import aws_cdk as cdk
+from aws_cdk import App, Environment
 from stacks.rag_stack import RagStack
 
 
-app = cdk.App()
+app = App()
 
 # Configuración del entorno
-env = cdk.Environment(
+env = Environment(
     account=os.getenv('CDK_DEFAULT_ACCOUNT'),
     region=os.getenv('CDK_DEFAULT_REGION', 'us-east-1')
 )

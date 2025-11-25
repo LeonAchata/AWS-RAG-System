@@ -14,6 +14,7 @@ from aws_cdk import (
     aws_opensearchservice as opensearch,
     aws_s3_notifications as s3n,
     aws_logs as logs,
+    aws_ec2 as ec2,
 )
 from constructs import Construct
 
@@ -100,12 +101,18 @@ class RagStack(Stack):
             capacity=opensearch.CapacityConfig(
                 data_node_instance_type="t3.small.search",  # Para dev/testing
                 data_nodes=1,  # Un solo nodo para dev (aumentar en prod)
+                multi_az_with_standby_enabled=False,  # Deshabilitado para T3
             ),
             
             # Volumen EBS
             ebs=opensearch.EbsOptions(
                 volume_size=10,  # GB - ajustar según volumen de datos
-                volume_type=opensearch.EbsDeviceVolumeType.GP3
+                volume_type=ec2.EbsDeviceVolumeType.GP3
+            ),
+            
+            # Zona de disponibilidad única para desarrollo
+            zone_awareness=opensearch.ZoneAwarenessConfig(
+                enabled=False
             ),
             
             # Acceso mediante IAM (más seguro que credenciales)
@@ -153,7 +160,7 @@ class RagStack(Stack):
         self.shared_layer = lambda_.LayerVersion(
             self,
             "SharedCodeLayer",
-            code=lambda_.Code.from_asset("shared"),
+            code=lambda_.Code.from_asset("../shared"),
             compatible_runtimes=[lambda_.Runtime.PYTHON_3_11],
             description="Código compartido: clientes Bedrock y OpenSearch"
         )
@@ -190,7 +197,7 @@ class RagStack(Stack):
             "IngestionLambda",
             runtime=lambda_.Runtime.PYTHON_3_11,
             handler="handler.lambda_handler",
-            code=lambda_.Code.from_asset("lambda/ingestion"),
+            code=lambda_.Code.from_asset("../lambda/ingestion"),
             timeout=Duration.minutes(5),
             memory_size=2048,
             role=ingestion_role,
@@ -198,12 +205,10 @@ class RagStack(Stack):
             environment={
                 "OPENSEARCH_ENDPOINT": self.opensearch_domain.domain_endpoint,
                 "OPENSEARCH_INDEX": "rag-documents",
-                "AWS_REGION": self.region,
                 "BEDROCK_EMBEDDING_MODEL": "amazon.titan-embed-text-v2:0",
                 "CHUNK_SIZE": "800",
                 "CHUNK_OVERLAP": "100"
-            },
-            log_retention=logs.RetentionDays.ONE_WEEK
+            }
         )
 
         # Permisos de S3
@@ -245,7 +250,7 @@ class RagStack(Stack):
             "QueryLambda",
             runtime=lambda_.Runtime.PYTHON_3_11,
             handler="handler.lambda_handler",
-            code=lambda_.Code.from_asset("lambda/query"),
+            code=lambda_.Code.from_asset("../lambda/query"),
             timeout=Duration.seconds(60),
             memory_size=1024,
             role=query_role,
@@ -253,14 +258,12 @@ class RagStack(Stack):
             environment={
                 "OPENSEARCH_ENDPOINT": self.opensearch_domain.domain_endpoint,
                 "OPENSEARCH_INDEX": "rag-documents",
-                "AWS_REGION": self.region,
                 "BEDROCK_EMBEDDING_MODEL": "amazon.titan-embed-text-v2:0",
                 "BEDROCK_LLM_MODEL": "anthropic.claude-3-sonnet-20240229-v1:0",
                 "TOP_K": "5",
                 "MIN_SIMILARITY": "0.7",
                 "USE_CACHE": "true"
-            },
-            log_retention=logs.RetentionDays.ONE_WEEK
+            }
         )
 
         # Permisos de OpenSearch
