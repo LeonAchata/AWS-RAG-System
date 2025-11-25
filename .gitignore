@@ -62,3 +62,12 @@ htmlcov/
 tmp/
 temp/
 *.tmp
+
+# Lambda Layer Build (generated)
+layer_build/
+
+# Local testing
+*.local.json
+test_*.py
+
+CV_Leon.pdf
