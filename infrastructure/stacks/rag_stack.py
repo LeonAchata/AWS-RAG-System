@@ -11,16 +11,16 @@ from aws_cdk import (
     aws_lambda as lambda_,
     aws_apigateway as apigateway,
     aws_iam as iam,
-    aws_opensearchservice as opensearch,
-    aws_s3_notifications as s3n,
-    aws_logs as logs,
+    aws_rds as rds,
     aws_ec2 as ec2,
+    aws_secretsmanager as secretsmanager,
+    aws_s3_notifications as s3n,
 )
 from constructs import Construct
 
 
 class RagStack(Stack):
-    """Stack principal del sistema RAG con AWS Bedrock y OpenSearch"""
+    """Stack principal del sistema RAG con AWS Bedrock y RDS PostgreSQL + pgvector"""
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -28,8 +28,8 @@ class RagStack(Stack):
         # 1. Crear S3 Buckets
         self.create_s3_buckets()
 
-        # 2. Crear OpenSearch Domain
-        self.create_opensearch_domain()
+        # 2. Crear RDS PostgreSQL con pgvector (público)
+        self.create_rds_database()
 
         # 3. Crear Lambda Layer con dependencias compartidas
         self.create_lambda_layers()
@@ -81,76 +81,54 @@ class RagStack(Stack):
             auto_delete_objects=True
         )
 
-    def create_opensearch_domain(self):
-        """Crea el dominio de OpenSearch con k-NN habilitado"""
+    def create_rds_database(self):
+        """Crea RDS PostgreSQL público con extensión pgvector (Free Tier)"""
         
-        # Rol de acceso para OpenSearch
-        opensearch_role = iam.Role(
+        # Usar VPC por defecto
+        self.vpc = ec2.Vpc.from_lookup(
             self,
-            "OpenSearchRole",
-            assumed_by=iam.ServicePrincipal("opensearchservice.amazonaws.com")
+            "DefaultVPC",
+            is_default=True
+        )
+        
+        # Credenciales en Secrets Manager
+        self.db_credentials = rds.DatabaseSecret(
+            self,
+            "DBCredentials",
+            username="rag_admin"
         )
 
-        # Dominio OpenSearch (configuración para desarrollo/testing)
-        self.opensearch_domain = opensearch.Domain(
+        # Instancia RDS PostgreSQL pública
+        self.database = rds.DatabaseInstance(
             self,
-            "RagOpenSearchDomain",
-            version=opensearch.EngineVersion.OPENSEARCH_2_11,
-            
-            # Configuración de nodos (ajustar según necesidad)
-            capacity=opensearch.CapacityConfig(
-                data_node_instance_type="t3.small.search",  # Para dev/testing
-                data_nodes=1,  # Un solo nodo para dev (aumentar en prod)
-                multi_az_with_standby_enabled=False,  # Deshabilitado para T3
+            "RagDatabase",
+            engine=rds.DatabaseInstanceEngine.postgres(
+                version=rds.PostgresEngineVersion.VER_15
             ),
-            
-            # Volumen EBS
-            ebs=opensearch.EbsOptions(
-                volume_size=10,  # GB - ajustar según volumen de datos
-                volume_type=ec2.EbsDeviceVolumeType.GP3
+            instance_type=ec2.InstanceType.of(
+                ec2.InstanceClass.BURSTABLE3,
+                ec2.InstanceSize.MICRO  # Free Tier
             ),
-            
-            # Zona de disponibilidad única para desarrollo
-            zone_awareness=opensearch.ZoneAwarenessConfig(
-                enabled=False
+            vpc=self.vpc,  # Usar VPC por defecto
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PUBLIC
             ),
-            
-            # Acceso mediante IAM (más seguro que credenciales)
-            use_unsigned_basic_auth=False,
-            fine_grained_access_control=opensearch.AdvancedSecurityOptions(
-                master_user_arn=opensearch_role.role_arn
-            ),
-            
-            # Cifrado
-            encryption_at_rest=opensearch.EncryptionAtRestOptions(
-                enabled=True
-            ),
-            node_to_node_encryption=True,
-            enforce_https=True,
-            
-            # Logs
-            logging=opensearch.LoggingOptions(
-                slow_search_log_enabled=True,
-                app_log_enabled=True,
-                slow_index_log_enabled=True
-            ),
-            
-            # Política de eliminación para desarrollo
-            removal_policy=RemovalPolicy.DESTROY
+            credentials=rds.Credentials.from_secret(self.db_credentials),
+            database_name="ragdb",
+            allocated_storage=20,  # GB - Free Tier
+            storage_type=rds.StorageType.GP2,
+            backup_retention=Duration.days(0),  # Sin backups para desarrollo
+            delete_automated_backups=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            deletion_protection=False,
+            publicly_accessible=True,  # RDS público
+            multi_az=False  # Single AZ para Free Tier
         )
 
-        # Política de acceso para el dominio
-        self.opensearch_domain.add_access_policies(
-            iam.PolicyStatement(
-                principals=[iam.AnyPrincipal()],
-                actions=["es:*"],
-                resources=[f"{self.opensearch_domain.domain_arn}/*"],
-                conditions={
-                    "IpAddress": {
-                        "aws:SourceIp": ["0.0.0.0/0"]  # Ajustar en producción
-                    }
-                }
-            )
+        # Security Group: permitir acceso desde cualquier IP (solo para demo)
+        # En producción, limitar a IPs específicas
+        self.database.connections.allow_default_port_from_any_ipv4(
+            "Allow PostgreSQL from Lambda and internet"
         )
 
     def create_lambda_layers(self):
@@ -187,11 +165,11 @@ class RagStack(Stack):
                     "bedrock:InvokeModel",
                     "bedrock:InvokeModelWithResponseStream"
                 ],
-                resources=["*"]  # Bedrock requiere wildcard
+                resources=["*"]
             )
         )
 
-        # Función Lambda de Ingesta
+        # Función Lambda de Ingesta (sin VPC)
         self.ingestion_lambda = lambda_.Function(
             self,
             "IngestionLambda",
@@ -203,20 +181,20 @@ class RagStack(Stack):
             role=ingestion_role,
             layers=[self.shared_layer],
             environment={
-                "OPENSEARCH_ENDPOINT": self.opensearch_domain.domain_endpoint,
-                "OPENSEARCH_INDEX": "rag-documents",
+                "DB_SECRET_ARN": self.db_credentials.secret_arn,
+                "DB_NAME": "ragdb",
                 "BEDROCK_EMBEDDING_MODEL": "amazon.titan-embed-text-v2:0",
                 "CHUNK_SIZE": "800",
                 "CHUNK_OVERLAP": "100"
             }
         )
 
+        # Permisos para leer secret
+        self.db_credentials.grant_read(self.ingestion_lambda)
+
         # Permisos de S3
         self.raw_bucket.grant_read(self.ingestion_lambda)
         self.processed_bucket.grant_write(self.ingestion_lambda)
-
-        # Permisos de OpenSearch
-        self.opensearch_domain.grant_read_write(self.ingestion_lambda)
 
     def create_query_lambda(self):
         """Crea la función Lambda para queries"""
@@ -244,7 +222,7 @@ class RagStack(Stack):
             )
         )
 
-        # Función Lambda de Query
+        # Función Lambda de Query (sin VPC)
         self.query_lambda = lambda_.Function(
             self,
             "QueryLambda",
@@ -256,8 +234,8 @@ class RagStack(Stack):
             role=query_role,
             layers=[self.shared_layer],
             environment={
-                "OPENSEARCH_ENDPOINT": self.opensearch_domain.domain_endpoint,
-                "OPENSEARCH_INDEX": "rag-documents",
+                "DB_SECRET_ARN": self.db_credentials.secret_arn,
+                "DB_NAME": "ragdb",
                 "BEDROCK_EMBEDDING_MODEL": "amazon.titan-embed-text-v2:0",
                 "BEDROCK_LLM_MODEL": "anthropic.claude-3-sonnet-20240229-v1:0",
                 "TOP_K": "5",
@@ -266,8 +244,8 @@ class RagStack(Stack):
             }
         )
 
-        # Permisos de OpenSearch
-        self.opensearch_domain.grant_read(self.query_lambda)
+        # Permisos para leer secret
+        self.db_credentials.grant_read(self.query_lambda)
 
     def create_api_gateway(self):
         """Crea API Gateway REST para exponer endpoints"""
@@ -281,9 +259,7 @@ class RagStack(Stack):
             deploy_options=apigateway.StageOptions(
                 stage_name="prod",
                 throttling_rate_limit=100,
-                throttling_burst_limit=200,
-                logging_level=apigateway.MethodLoggingLevel.INFO,
-                data_trace_enabled=True
+                throttling_burst_limit=200
             ),
             default_cors_preflight_options=apigateway.CorsOptions(
                 allow_origins=apigateway.Cors.ALL_ORIGINS,
@@ -406,20 +382,20 @@ class RagStack(Stack):
             export_name="RagRawBucketName"
         )
 
-        # Endpoint de OpenSearch
+        # Endpoint de RDS
         CfnOutput(
             self,
-            "OpenSearchEndpoint",
-            value=self.opensearch_domain.domain_endpoint,
-            description="Endpoint del dominio OpenSearch"
+            "DatabaseEndpoint",
+            value=self.database.db_instance_endpoint_address,
+            description="Endpoint de la base de datos PostgreSQL"
         )
 
-        # Dashboard URL de OpenSearch
+        # Secret ARN
         CfnOutput(
             self,
-            "OpenSearchDashboard",
-            value=f"https://{self.opensearch_domain.domain_endpoint}/_dashboards",
-            description="URL del dashboard de OpenSearch"
+            "DatabaseSecretArn",
+            value=self.db_credentials.secret_arn,
+            description="ARN del secret con credenciales de DB"
         )
 
         # ARN de Lambda de Ingesta
