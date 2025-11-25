@@ -10,12 +10,9 @@ from typing import Dict, Any, List, Optional
 # Importar utilidades locales
 from utils.prompt_builder import (
     build_rag_prompt,
-    build_conversational_prompt,
     format_response_with_sources,
-    calculate_response_confidence,
     sanitize_query
 )
-from utils.cache import get_cache, should_use_cache
 
 # Importar clientes compartidos
 import sys
@@ -23,20 +20,19 @@ sys.path.append('/opt/python')  # Para Lambda Layers
 
 try:
     from shared.utils.bedrock_client import get_bedrock_client
-    from shared.utils.opensearch_client import get_opensearch_client
-except ImportError:
-    print("Warning: No se pudieron importar shared utilities")
+    from shared.utils.postgres_client import PostgresVectorClient
+except ImportError as e:
+    print(f"Warning: No se pudieron importar shared utilities: {e}")
 
 
 # Variables de entorno
-OPENSEARCH_ENDPOINT = os.environ.get('OPENSEARCH_ENDPOINT')
-OPENSEARCH_INDEX = os.environ.get('OPENSEARCH_INDEX', 'rag-documents')
+DB_SECRET_ARN = os.environ.get('DB_SECRET_ARN')
+DB_NAME = os.environ.get('DB_NAME', 'ragdb')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 BEDROCK_EMBEDDING_MODEL = os.environ.get('BEDROCK_EMBEDDING_MODEL', 'amazon.titan-embed-text-v2:0')
 BEDROCK_LLM_MODEL = os.environ.get('BEDROCK_LLM_MODEL', 'anthropic.claude-3-sonnet-20240229-v1:0')
 TOP_K = int(os.environ.get('TOP_K', '5'))
-MIN_SIMILARITY = float(os.environ.get('MIN_SIMILARITY', '0.7'))
-USE_CACHE = os.environ.get('USE_CACHE', 'true').lower() == 'true'
+MIN_SIMILARITY = float(os.environ.get('MIN_SIMILARITY', '0.1'))
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -70,25 +66,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         filters = body.get('filters')
         top_k = body.get('top_k', TOP_K)
         min_similarity = body.get('min_similarity', MIN_SIMILARITY)
-        conversational = body.get('conversational', False)
-        conversation_history = body.get('conversation_history')
         include_sources = body.get('include_sources', True)
         
         print(f"Query: {query}")
-        print(f"Filters: {filters}, Top-K: {top_k}, Min Similarity: {min_similarity}")
-        
-        # Verificar caché si está habilitado
-        if USE_CACHE and should_use_cache(query):
-            cache = get_cache()
-            cached_result = cache.get(query, filters)
-            
-            if cached_result:
-                print("Respuesta obtenida del caché")
-                return success_response({
-                    **cached_result,
-                    'from_cache': True,
-                    'response_time': time.time() - start_time
-                })
+        print(f"Top-K: {top_k}, Min Similarity: {min_similarity}")
         
         # Procesar query
         result = process_query(
@@ -96,18 +77,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             filters=filters,
             top_k=top_k,
             min_similarity=min_similarity,
-            conversational=conversational,
-            conversation_history=conversation_history,
             include_sources=include_sources
         )
         
-        # Cachear resultado si es apropiado
-        if USE_CACHE and should_use_cache(query):
-            cache = get_cache()
-            cache.set(query, result, filters)
-        
         result['response_time'] = time.time() - start_time
-        result['from_cache'] = False
         
         return success_response(result)
         
@@ -126,8 +99,6 @@ def process_query(
     filters: Optional[Dict[str, Any]] = None,
     top_k: int = 5,
     min_similarity: float = 0.7,
-    conversational: bool = False,
-    conversation_history: Optional[List[Dict[str, str]]] = None,
     include_sources: bool = True
 ) -> Dict[str, Any]:
     """
@@ -154,88 +125,56 @@ def process_query(
         model_id=BEDROCK_EMBEDDING_MODEL
     )
     
-    print(f"Embedding generado: {len(query_embedding)} dimensiones")
+    print(f"Embedding generado. Dimensión: {len(query_embedding)}")
     
-    # 2. Buscar documentos similares en OpenSearch
-    print(f"Buscando documentos relevantes (top-{top_k})...")
-    opensearch_client = get_opensearch_client(
-        endpoint=OPENSEARCH_ENDPOINT,
-        region=AWS_REGION,
-        index_name=OPENSEARCH_INDEX
-    )
+    # 2. Buscar documentos relevantes en PostgreSQL
+    print(f"Buscando documentos similares en PostgreSQL...")
+    with PostgresVectorClient(
+        db_secret_arn=DB_SECRET_ARN,
+        db_name=DB_NAME,
+        region=AWS_REGION
+    ) as pg_client:
+        documents = pg_client.search_similar(
+            query_embedding=query_embedding,
+            top_k=top_k,
+            min_similarity=min_similarity
+        )
     
-    relevant_chunks = opensearch_client.search_similar(
-        query_embedding=query_embedding,
-        k=top_k,
-        min_score=min_similarity,
-        filters=filters
-    )
+    print(f"Se encontraron {len(documents)} documentos relevantes")
     
-    print(f"Encontrados {len(relevant_chunks)} chunks relevantes")
-    
-    # Verificar si se encontraron resultados
-    if not relevant_chunks:
+    # Si no hay documentos relevantes
+    if not documents:
         return {
-            'answer': "No encontré información relevante en los documentos para responder tu pregunta.",
+            'answer': 'No encontré información relevante para responder tu pregunta. Por favor, intenta reformular tu consulta o sube documentos relacionados.',
             'sources': [],
-            'confidence': {
-                'confidence': 'none',
-                'avg_similarity': 0.0,
-                'max_similarity': 0.0,
-                'chunks_retrieved': 0
-            }
+            'num_sources': 0,
+            'confidence': 0.0
         }
     
     # 3. Construir prompt con contexto
     print("Construyendo prompt...")
+    prompt = build_rag_prompt(
+        query=query,
+        documents=documents
+    )
     
-    if conversational and conversation_history:
-        system_prompt, user_prompt = build_conversational_prompt(
-            query=query,
-            context_chunks=relevant_chunks,
-            conversation_history=conversation_history
-        )
-    else:
-        system_prompt, user_prompt = build_rag_prompt(
-            query=query,
-            context_chunks=relevant_chunks
-        )
-    
-    # 4. Generar respuesta con el LLM
-    print("Generando respuesta con LLM...")
-    
-    answer = bedrock_client.generate_response(
-        prompt=user_prompt,
-        system_prompt=system_prompt,
+    # 4. Generar respuesta con LLM
+    print("Generando respuesta con Claude...")
+    response_text = bedrock_client.generate_response(
+        prompt=prompt,
         model_id=BEDROCK_LLM_MODEL,
         temperature=0.2,
         max_tokens=2048
     )
     
-    print(f"Respuesta generada: {len(answer)} caracteres")
+    print("Respuesta generada")
     
-    # 5. Calcular métricas de confianza
-    similarity_scores = [chunk['score'] for chunk in relevant_chunks]
-    confidence = calculate_response_confidence(
-        similarity_scores=similarity_scores,
-        num_chunks=len(relevant_chunks)
+    # 5. Formatear respuesta con fuentes
+    result = format_response_with_sources(
+        response_text=response_text,
+        documents=documents,
+        include_sources=include_sources
     )
-    
-    # 6. Formatear respuesta final
-    if include_sources:
-        result = format_response_with_sources(
-            answer=answer,
-            sources=relevant_chunks,
-            include_scores=True
-        )
-    else:
-        result = {
-            'answer': answer,
-            'total_chunks_used': len(relevant_chunks)
-        }
-    
-    result['confidence'] = confidence
-    result['query'] = query
     
     return result
 
@@ -265,18 +204,3 @@ def success_response(data: Dict[str, Any]) -> Dict[str, Any]:
         'body': json.dumps(data, ensure_ascii=False)
     }
 
-
-def validate_environment():
-    """Valida que las variables de entorno necesarias estén configuradas"""
-    required_vars = ['OPENSEARCH_ENDPOINT']
-    missing_vars = [var for var in required_vars if not os.environ.get(var)]
-    
-    if missing_vars:
-        raise ValueError(f"Variables de entorno faltantes: {', '.join(missing_vars)}")
-
-
-# Validar entorno al inicializar
-try:
-    validate_environment()
-except Exception as e:
-    print(f"Warning: {str(e)}")

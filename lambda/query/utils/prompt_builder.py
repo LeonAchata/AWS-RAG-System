@@ -6,22 +6,34 @@ from typing import List, Dict, Any, Optional
 
 def build_rag_prompt(
     query: str,
-    context_chunks: List[Dict[str, Any]],
-    system_instructions: Optional[str] = None
-) -> tuple[str, str]:
+    documents: List[Dict[str, Any]]
+) -> str:
     """
     Construye el prompt para el modelo LLM incluyendo contexto recuperado
     
     Args:
         query: Pregunta del usuario
-        context_chunks: Lista de chunks relevantes recuperados
-        system_instructions: Instrucciones adicionales para el sistema
+        documents: Lista de documentos relevantes de PostgreSQL
         
     Returns:
-        Tupla de (system_prompt, user_prompt)
+        Prompt completo para el LLM
     """
-    # System prompt por defecto
-    default_system = """Eres un asistente experto que responde preguntas basándose únicamente en el contexto proporcionado.
+    # Construir contexto a partir de los documentos
+    context_parts = []
+    for i, doc in enumerate(documents, 1):
+        metadata = doc.get('metadata', {})
+        filename = metadata.get('filename', 'documento desconocido') if metadata else 'documento'
+        content = doc.get('content', '')
+        similarity = doc.get('similarity', 0)
+        
+        context_parts.append(
+            f"[Fuente {i}: {filename} (similitud: {similarity:.2f})]\n{content}\n"
+        )
+    
+    context_text = "\n---\n".join(context_parts)
+    
+    # Prompt completo
+    prompt = f"""Eres un asistente experto que responde preguntas basándose únicamente en el contexto proporcionado.
 
 Instrucciones:
 1. Responde SOLO basándote en la información del contexto proporcionado
@@ -29,26 +41,9 @@ Instrucciones:
 3. Sé conciso pero completo en tus respuestas
 4. Si citas información, menciona de qué documento proviene
 5. Mantén un tono profesional y claro
-6. No inventes información que no esté en el contexto"""
+6. No inventes información que no esté en el contexto
 
-    system_prompt = system_instructions if system_instructions else default_system
-    
-    # Construir contexto a partir de los chunks
-    context_parts = []
-    for i, chunk in enumerate(context_chunks, 1):
-        metadata = chunk.get('metadata', {})
-        filename = metadata.get('filename', 'documento desconocido')
-        content = chunk.get('content', '')
-        score = chunk.get('score', 0)
-        
-        context_parts.append(
-            f"[Fuente {i}: {filename} (relevancia: {score:.2f})]\n{content}\n"
-        )
-    
-    context_text = "\n---\n".join(context_parts)
-    
-    # User prompt con contexto y pregunta
-    user_prompt = f"""Contexto de documentos relevantes:
+Contexto de documentos relevantes:
 
 {context_text}
 
@@ -58,7 +53,7 @@ Pregunta del usuario: {query}
 
 Por favor, responde la pregunta basándote únicamente en el contexto proporcionado arriba."""
 
-    return system_prompt, user_prompt
+    return prompt
 
 
 def build_conversational_prompt(
@@ -159,48 +154,41 @@ def extract_keywords(query: str) -> List[str]:
 
 
 def format_response_with_sources(
-    answer: str,
-    sources: List[Dict[str, Any]],
-    include_scores: bool = False
+    response_text: str,
+    documents: List[Dict[str, Any]],
+    include_sources: bool = True
 ) -> Dict[str, Any]:
     """
     Formatea la respuesta incluyendo las fuentes
     
     Args:
-        answer: Respuesta generada por el LLM
-        sources: Lista de chunks usados como fuente
-        include_scores: Si incluir scores de similitud
+        response_text: Respuesta generada por el LLM
+        documents: Lista de documentos de PostgreSQL
+        include_sources: Si incluir fuentes en la respuesta
         
     Returns:
         Respuesta formateada con fuentes
     """
-    # Procesar fuentes únicas
-    unique_sources = {}
-    for source in sources:
-        doc_id = source.get('document_id')
-        if doc_id not in unique_sources:
-            metadata = source.get('metadata', {})
-            unique_sources[doc_id] = {
-                'document_id': doc_id,
-                'filename': metadata.get('filename', 'Desconocido'),
-                'title': metadata.get('title', metadata.get('filename', 'Sin título')),
-                'chunks_used': []
-            }
-            
-            if include_scores:
-                unique_sources[doc_id]['score'] = source.get('score', 0)
-        
-        # Agregar chunk
-        unique_sources[doc_id]['chunks_used'].append({
-            'chunk_index': source.get('chunk_index', 0),
-            'score': source.get('score', 0)
-        })
-    
-    return {
-        'answer': answer,
-        'sources': list(unique_sources.values()),
-        'total_chunks_used': len(sources)
+    result = {
+        'answer': response_text,
+        'num_sources': len(documents)
     }
+    
+    if include_sources:
+        # Procesar fuentes únicas
+        sources = []
+        for doc in documents:
+            metadata = doc.get('metadata', {}) or {}
+            sources.append({
+                'document_id': doc.get('document_id'),
+                'filename': metadata.get('filename', 'Desconocido'),
+                'similarity': doc.get('similarity', 0)
+            })
+        
+        result['sources'] = sources
+        result['confidence'] = documents[0].get('similarity', 0) if documents else 0.0
+    
+    return result
 
 
 def calculate_response_confidence(
