@@ -1,6 +1,6 @@
 """
 AWS Lambda Handler para Ingesta de Documentos
-Procesa documentos, genera embeddings y los indexa en OpenSearch
+Procesa documentos, genera embeddings y los indexa en PostgreSQL + pgvector
 """
 import json
 import os
@@ -13,24 +13,23 @@ from typing import Dict, Any, List
 from utils.document_processor import DocumentProcessor, get_metadata_from_file
 from utils.text_chunker import chunk_text, clean_text
 
-# Importar clientes compartidos (necesitarán estar en Lambda Layer o empaquetados)
+# Importar clientes compartidos
 import sys
 sys.path.append('/opt/python')  # Para Lambda Layers
 
 try:
     from shared.utils.bedrock_client import get_bedrock_client
-    from shared.utils.opensearch_client import get_opensearch_client
-except ImportError:
-    # Fallback para desarrollo local
-    print("Warning: No se pudieron importar shared utilities")
+    from shared.utils.postgres_client import PostgresVectorClient
+except ImportError as e:
+    print(f"Warning: No se pudieron importar shared utilities: {e}")
 
 
 # Cliente S3
 s3_client = boto3.client('s3')
 
 # Variables de entorno
-OPENSEARCH_ENDPOINT = os.environ.get('OPENSEARCH_ENDPOINT')
-OPENSEARCH_INDEX = os.environ.get('OPENSEARCH_INDEX', 'rag-documents')
+DB_SECRET_ARN = os.environ.get('DB_SECRET_ARN')
+DB_NAME = os.environ.get('DB_NAME', 'ragdb')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 BEDROCK_EMBEDDING_MODEL = os.environ.get('BEDROCK_EMBEDDING_MODEL', 'amazon.titan-embed-text-v2:0')
 CHUNK_SIZE = int(os.environ.get('CHUNK_SIZE', '800'))
@@ -62,6 +61,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
     except Exception as e:
         print(f"Error en lambda_handler: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
             'statusCode': 500,
             'body': json.dumps({
@@ -102,7 +103,7 @@ def process_s3_event(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'file': key,
                 'status': 'success',
                 'document_id': result['document_id'],
-                'chunks_created': result['chunks_count']
+                'chunks_created': result.get('chunks_count', 0)
             })
             
         except Exception as e:
@@ -220,65 +221,104 @@ def process_document(
     
     print(f"Generado {len(chunks)} chunks")
     
-    # 5. Generar embeddings para cada chunk
-    print("Generando embeddings...")
+    # 5. Generar embeddings e indexar en PostgreSQL
+    print("Generando embeddings e indexando...")
     bedrock_client = get_bedrock_client(region_name=AWS_REGION)
     
-    chunks_data = []
-    for chunk in chunks:
+    documents_to_index = []
+    for i, chunk in enumerate(chunks):
         # Generar embedding
         embedding = bedrock_client.generate_embeddings(
             text=chunk.content,
             model_id=BEDROCK_EMBEDDING_MODEL
         )
         
-        chunk_id = f"{document_id}_{chunk.chunk_index}"
+        chunk_document_id = f"{document_id}_chunk_{i}"
         
-        chunks_data.append({
-            'chunk_id': chunk_id,
-            'document_id': document_id,
+        documents_to_index.append({
+            'document_id': chunk_document_id,
             'content': chunk.content,
             'embedding': embedding,
-            'chunk_index': chunk.chunk_index,
-            'metadata': metadata
+            'metadata': {
+                **metadata,
+                'chunk_index': i,
+                'parent_document_id': document_id
+            }
         })
     
-    print(f"Embeddings generados para {len(chunks_data)} chunks")
+    print(f"Embeddings generados para {len(documents_to_index)} chunks")
     
-    # 6. Indexar en OpenSearch
-    print("Indexando en OpenSearch...")
-    opensearch_client = get_opensearch_client(
-        endpoint=OPENSEARCH_ENDPOINT,
-        region=AWS_REGION,
-        index_name=OPENSEARCH_INDEX
-    )
+    # 6. Indexar en PostgreSQL
+    with PostgresVectorClient(
+        db_secret_arn=DB_SECRET_ARN,
+        db_name=DB_NAME,
+        region=AWS_REGION
+    ) as pg_client:
+        indexed_count = pg_client.bulk_index_documents(documents_to_index)
     
-    result = opensearch_client.index_documents_batch(chunks_data)
-    
-    print(f"Indexación completada: {result['success']} exitosos, {result['failed']} fallidos")
+    print(f"Indexación completada: {indexed_count} documentos indexados")
     
     return {
         'document_id': document_id,
         'filename': filename,
-        'chunks_count': len(chunks_data),
-        'indexing_result': result,
+        'chunks_count': len(documents_to_index),
+        'indexed_count': indexed_count,
         'metadata': metadata
     }
 
 
-def validate_environment():
+def process_api_event(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Valida que las variables de entorno necesarias estén configuradas
+    Procesa un evento de API Gateway (carga directa vía API)
     """
-    required_vars = ['OPENSEARCH_ENDPOINT']
-    missing_vars = [var for var in required_vars if not os.environ.get(var)]
-    
-    if missing_vars:
-        raise ValueError(f"Variables de entorno faltantes: {', '.join(missing_vars)}")
+    try:
+        # Parsear body si es string
+        body = event.get('body', {})
+        if isinstance(body, str):
+            body = json.loads(body)
+        
+        # Validar parámetros requeridos
+        if 'content' not in body:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({
+                    'error': 'Parámetro "content" requerido'
+                })
+            }
+        
+        # Procesar documento directamente desde contenido
+        content = body['content']
+        filename = body.get('filename', 'document.txt')
+        
+        # Si el contenido está en base64, decodificar
+        import base64
+        if body.get('is_base64', False):
+            file_content = base64.b64decode(content)
+        else:
+            file_content = content.encode('utf-8')
+        
+        result = process_document(
+            file_content=file_content,
+            filename=filename,
+            file_size=len(file_content),
+            source='api_upload'
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Documento procesado exitosamente',
+                'document_id': result['document_id'],
+                'chunks_count': result['chunks_count']
+            })
+        }
+        
+    except Exception as e:
+        print(f"Error en process_api_event: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e)
+            })
+        }
 
-
-# Validar entorno al inicializar
-try:
-    validate_environment()
-except Exception as e:
-    print(f"Warning: {str(e)}")
